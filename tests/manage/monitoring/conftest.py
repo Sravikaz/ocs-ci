@@ -12,10 +12,7 @@ from ocs_ci.ocs.bucket_utils import craft_s3_command
 from ocs_ci.ocs.fiojob import workload_fio_storageutilization
 from ocs_ci.ocs.resources import pod
 from ocs_ci.ocs.resources.objectbucket import MCGS3Bucket
-from ocs_ci.ocs.resources.pod import (
-    delete_pods,
-    get_osd_pods_having_ids,
-)
+from ocs_ci.ocs.resources.pod import get_osd_pods_having_ids
 from ocs_ci.utility.utils import ceph_health_check, TimeoutSampler
 from ocs_ci.utility.workloadfixture import measure_operation, is_measurement_done
 from ocs_ci.helpers import helpers
@@ -828,16 +825,26 @@ def measure_ceph_osd_flapping(measurement_dir):
         Delete osd with id 0 for 6 times with 10 seconds sleep between the deletions
 
         """
-
-        run_time = 10  # sleep time between OSD deletion
+        ocp_obj = ocp.OCP()
+        target_osd = get_osd_pods_having_ids(["0"])
+        print(target_osd)
+        run_time = 45  # sleep time between OSD deletion
         for i in range(6):
-            target_osd = get_osd_pods_having_ids(["0"])
-            print(target_osd)
-            logger.info(f"Deleting OSD {target_osd}")
-            delete_pods(target_osd)
-            logger.info(f"{target_osd} was deleted")
+
+            # logger.info(f"Deleting OSD {target_osd}")
+            # delete_pods(target_osd)
+            logger.info("down scaling osd")
+            ocp_obj.exec_oc_cmd(
+                f"scale --replicas=0 deployment/rook-ceph-osd-0 -n openshift-storage"
+            )
+            logger.info(f"{target_osd} was downscaled")
             logger.info(f"Waiting for {run_time} seconds")
             time.sleep(run_time)
+            ocp_obj.exec_oc_cmd(
+                f"scale --replicas=1 deployment/rook-ceph-osd-0 -n openshift-storage"
+            )
+            logger.info("up scaling osd")
+            # time.sleep(run_time)
 
     test_file = os.path.join(measurement_dir, "measure_ceph_osd_flapping.json")
     measured_op = measure_operation(stop_osd, test_file)
