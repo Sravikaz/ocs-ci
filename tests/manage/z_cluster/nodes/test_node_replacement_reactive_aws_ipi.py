@@ -2,10 +2,9 @@ import logging
 import pytest
 
 from ocs_ci.framework.testlib import (
-    tier4,
-    tier4b,
+    tier4a,
     ManageTest,
-    aws_platform_required,
+    aws_based_platform_required,
     ipi_deployment_required,
     ignore_leftovers,
 )
@@ -29,9 +28,8 @@ log = logging.getLogger(__name__)
 
 
 @ignore_leftovers
-@tier4
-@tier4b
-@aws_platform_required
+@tier4a
+@aws_based_platform_required
 @ipi_deployment_required
 class TestNodeReplacement(ManageTest):
     """

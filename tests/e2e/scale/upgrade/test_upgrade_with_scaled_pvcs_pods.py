@@ -9,6 +9,7 @@ from ocs_ci.ocs.scale_lib import FioPodScale
 from ocs_ci.utility.utils import ocsci_log_path
 from ocs_ci.ocs.resources.pvc import get_all_pvcs
 from ocs_ci.framework.pytest_customization.marks import (
+    bugzilla,
     pre_upgrade,
     post_upgrade,
     skipif_bm,
@@ -32,6 +33,7 @@ SCALE_DATA_FILE = f"{log_path}/scale_data_file.yaml"
 @skipif_bm
 @pre_upgrade
 @ipi_deployment_required
+@bugzilla("1862854")
 @pytest.mark.polarion_id("OCS-755")
 def test_scale_pvcs_pods_pre_upgrade():
     """
@@ -68,7 +70,7 @@ def test_scale_pvcs_pods_pre_upgrade():
             )
         )
 
-    logging.info(
+    log.info(
         f"Running PODs count {len(pod_running_list)} & "
         f"Bound PVCs count {len(pvc_bound_list)} "
         f"in namespace {fioscale.namespace}"
@@ -90,6 +92,7 @@ def test_scale_pvcs_pods_pre_upgrade():
 @skipif_external_mode
 @post_upgrade
 @ipi_deployment_required
+@bugzilla("1862854")
 @pytest.mark.polarion_id("OCS-755")
 def test_scale_pvcs_pods_post_upgrade():
     """
@@ -133,7 +136,7 @@ def test_scale_pvcs_pods_post_upgrade():
             f"PVCs not in Bound state {pvc_not_bound_list}"
         )
     else:
-        logging.info(f"All the expected {len(pvc_bound_list)} PVCs are in Bound state")
+        log.info(f"All the expected {len(pvc_bound_list)} PVCs are in Bound state")
 
     if not len(pod_running_list) == len(pod_scale_list):
         raise UnexpectedBehaviour(
@@ -141,9 +144,7 @@ def test_scale_pvcs_pods_post_upgrade():
             f"PODs not in Running state {pod_not_running_list}"
         )
     else:
-        logging.info(
-            f"All the expected {len(pod_running_list)} PODs are in Running state"
-        )
+        log.info(f"All the expected {len(pod_running_list)} PODs are in Running state")
 
     # Check ceph health status
     utils.ceph_health_check()

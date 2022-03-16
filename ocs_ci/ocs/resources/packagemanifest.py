@@ -212,12 +212,9 @@ class PackageManifest(OCP):
             )
         install_plans.reverse()
         for ip in install_plans:
-            csv_names = ip["spec"]["clusterServiceVersionNames"]
-            if len(csv_names) != 1:
-                continue
-            csv_name = ip["spec"]["clusterServiceVersionNames"][0]
-            if pattern in csv_name and ip["spec"]["approved"]:
-                return csv_name
+            for csv_name in ip["spec"]["clusterServiceVersionNames"]:
+                if pattern in csv_name and ip["spec"]["approved"]:
+                    return csv_name
         raise CSVNotFound("No CSV found from approved install plans")
 
     def wait_for_resource(
@@ -275,12 +272,14 @@ def get_selector_for_ocs_operator():
     catalog_source = CatalogSource(
         resource_name=constants.OPERATOR_CATALOG_SOURCE_NAME,
         namespace=constants.MARKETPLACE_NAMESPACE,
+        selector=constants.OPERATOR_INTERNAL_SELECTOR,
     )
     try:
-        catalog_source.get()
-        return constants.OPERATOR_INTERNAL_SELECTOR
+        cs_data = catalog_source.get()
+        if cs_data["items"]:
+            return constants.OPERATOR_INTERNAL_SELECTOR
     except CommandFailed:
-        log.info("Catalog source not found!")
+        log.info("Internal catalog source not found!")
     operator_source = OCP(
         kind="OperatorSource",
         resource_name=constants.OPERATOR_SOURCE_NAME,

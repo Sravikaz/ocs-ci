@@ -15,13 +15,14 @@ import base64
 from semantic_version import Version
 
 from ocs_ci.ocs.bucket_utils import craft_s3_command
-from ocs_ci.ocs.ocp import OCP, verify_images_upgraded
+from ocs_ci.ocs.ocp import get_images, OCP, verify_images_upgraded
 from ocs_ci.helpers import helpers
 from ocs_ci.helpers.proxy import update_container_with_proxy_env
 from ocs_ci.ocs import constants, defaults, node, workload, ocp
 from ocs_ci.framework import config
 from ocs_ci.ocs.exceptions import (
     CommandFailed,
+    NotAllPodsHaveSameImagesError,
     NonUpgradedImagesFoundError,
     TimeoutExpiredError,
     UnavailableResourceException,
@@ -301,6 +302,10 @@ class Pod(OCS):
         bs="4K",
         end_fsync=0,
         invalidate=None,
+        buffer_compress_percentage=None,
+        buffer_pattern=None,
+        readwrite=None,
+        direct=0,
     ):
         """
         Execute FIO on a pod
@@ -330,6 +335,11 @@ class Pod(OCS):
             end_fsync (int): If 1, fio will sync file contents when a write
                 stage has completed. Fio default is 0
             invalidate (bool): Invalidate the buffer/page cache parts of the files to be used prior to starting I/O
+            buffer_compress_percentage (int): If this is set, then fio will attempt to provide I/O buffer
+                content (on WRITEs) that compresses to the specified level
+            buffer_pattern (str): fio will fill the I/O buffers with this pattern
+            readwrite (str): Type of I/O pattern default is randrw from yaml
+            direct(int): If value is 1, use non-buffered I/O. This is usually O_DIRECT. Fio default is 0.
 
         """
         if not self.wl_setup_done:
@@ -340,11 +350,13 @@ class Pod(OCS):
             self.io_params["rwmixread"] = rw_ratio
         else:
             self.io_params = templating.load_yaml(constants.FIO_IO_PARAMS_YAML)
-
         if invalidate is not None:
             self.io_params["invalidate"] = invalidate
-
-        self.io_params["runtime"] = runtime
+        if runtime != 0:
+            self.io_params["runtime"] = runtime
+        else:
+            del self.io_params["runtime"]
+            del self.io_params["time_based"]
         size = size if isinstance(size, str) else f"{size}G"
         self.io_params["size"] = size
         if fio_filename:
@@ -353,6 +365,13 @@ class Pod(OCS):
         self.io_params["rate"] = rate
         self.io_params["rate_process"] = rate_process
         self.io_params["bs"] = bs
+        self.io_params["direct"] = direct
+        if buffer_compress_percentage:
+            self.io_params["buffer_compress_percentage"] = buffer_compress_percentage
+        if buffer_pattern:
+            self.io_params["buffer_pattern"] = buffer_pattern
+        if readwrite:
+            self.io_params["readwrite"] = readwrite
         if end_fsync:
             self.io_params["end_fsync"] = end_fsync
         self.fio_thread = self.wl_obj.run(**self.io_params)
@@ -779,10 +798,10 @@ def get_fio_rw_iops(pod_obj):
         pod_obj (Pod): The object of the pod
     """
     fio_result = pod_obj.get_fio_results()
-    logging.info(f"FIO output: {fio_result}")
-    logging.info("IOPs after FIO:")
-    logging.info(f"Read: {fio_result.get('jobs')[0].get('read').get('iops')}")
-    logging.info(f"Write: {fio_result.get('jobs')[0].get('write').get('iops')}")
+    logger.info(f"FIO output: {fio_result}")
+    logger.info("IOPs after FIO:")
+    logger.info(f"Read: {fio_result.get('jobs')[0].get('read').get('iops')}")
+    logger.info(f"Write: {fio_result.get('jobs')[0].get('write').get('iops')}")
 
 
 def run_io_in_bg(pod_obj, expect_to_fail=False, fedora_dc=False):
@@ -1444,6 +1463,7 @@ def verify_pods_upgraded(old_images, selector, count=1, timeout=720):
     selector_label, selector_value = selector.split("=")
     while True:
         pod_count = 0
+        pod_images = {}
         try:
             pods = get_all_pods(namespace, [selector_value], selector_label)
             pods_len = len(pods)
@@ -1453,13 +1473,27 @@ def verify_pods_upgraded(old_images, selector, count=1, timeout=720):
                     f"Number of found pods {pods_len} is not as expected: " f"{count}"
                 )
             for pod in pods:
-                verify_images_upgraded(old_images, pod.get())
+                pod_obj = pod.get()
+                verify_images_upgraded(old_images, pod_obj)
+                current_pod_images = get_images(pod_obj)
+                for container_name, container_image in current_pod_images.items():
+                    if container_name not in pod_images:
+                        pod_images[container_name] = container_image
+                    else:
+                        if pod_images[container_name] != container_image:
+                            raise NotAllPodsHaveSameImagesError(
+                                f"Not all the pods with the selector: {selector} have the same "
+                                f"images! Image for container {container_name} has image {container_image} "
+                                f"which doesn't match with: {pod_images} differ! This means "
+                                "that upgrade hasn't finished to restart all the pods yet! "
+                                "Or it's caused by other discrepancy which needs to be investigated!"
+                            )
                 pod_count += 1
         except CommandFailed as ex:
             logger.warning(
                 f"Failed when getting pods with selector {selector}." f"Error: {ex}"
             )
-        except NonUpgradedImagesFoundError as ex:
+        except (NonUpgradedImagesFoundError, NotAllPodsHaveSameImagesError) as ex:
             logger.warning(ex)
         check_timeout_reached(start_time, timeout, info_message)
         if pods_len != count:
@@ -1540,10 +1574,10 @@ def wait_for_new_osd_pods_to_come_up(number_of_osd_pods_before):
                 pod.status() in status_options for pod in new_osd_pods
             ]
             if any(new_osd_pods_come_up):
-                logging.info("One or more of the new osd pods has started to come up")
+                logger.info("One or more of the new osd pods has started to come up")
                 break
     except TimeoutExpiredError:
-        logging.warning("None of the new osd pods reached the desired status")
+        logger.warning("None of the new osd pods reached the desired status")
 
 
 def get_pod_restarts_count(namespace=defaults.ROOK_CLUSTER_NAMESPACE):
@@ -1564,7 +1598,7 @@ def get_pod_restarts_count(namespace=defaults.ROOK_CLUSTER_NAMESPACE):
             and "rook-ceph-drain-canary" not in p.name
         ):
             restart_dict[p.name] = int(ocp_pod_obj.get_resource(p.name, "RESTARTS"))
-    logging.info(f"get_pod_restarts_count: restarts dict = {restart_dict}")
+    logger.info(f"get_pod_restarts_count: restarts dict = {restart_dict}")
     return restart_dict
 
 
@@ -1610,7 +1644,7 @@ def check_pods_in_running_state(
         ):
             status = ocp_pod_obj.get_resource(p.name, "STATUS")
             if status not in "Running":
-                logging.error(
+                logger.error(
                     f"The pod {p.name} is in {status} state. Expected = Running"
                 )
                 ret_val = False
@@ -1672,11 +1706,11 @@ def wait_for_pods_to_be_running(
         ):
             # Check if all the pods in running state
             if pods_running:
-                logging.info("All the pods reached status running!")
+                logger.info("All the pods reached status running!")
                 return True
 
     except TimeoutExpiredError:
-        logging.warning(
+        logger.warning(
             f"Not all the pods reached status running " f"after {timeout} seconds"
         )
         return False
@@ -1711,13 +1745,20 @@ def get_osd_removal_pod_name(osd_id, timeout=60):
         str: The osd removal pod name
 
     """
+    ocs_version_pattern_dict = {
+        "4.6": f"ocs-osd-removal-{osd_id}",
+        "4.7": "ocs-osd-removal-job",
+        "4.8": "ocs-osd-removal-",
+        "4.9": "ocs-osd-removal-job",
+    }
+
     ocs_version = config.ENV_DATA["ocs_version"]
-    if Version.coerce(ocs_version) == Version.coerce("4.7"):
-        pattern = "ocs-osd-removal-job"
-    elif Version.coerce(ocs_version) == Version.coerce("4.8"):
-        pattern = "ocs-osd-removal-"
-    else:
-        pattern = f"ocs-osd-removal-{osd_id}"
+    pattern = ocs_version_pattern_dict.get(ocs_version)
+    if not pattern:
+        logger.warning(
+            f"ocs version {ocs_version} didn't match any of the known versions"
+        )
+        return None
 
     try:
         for osd_removal_pod_names in TimeoutSampler(
@@ -1728,7 +1769,7 @@ def get_osd_removal_pod_name(osd_id, timeout=60):
         ):
             if osd_removal_pod_names:
                 osd_removal_pod_name = osd_removal_pod_names[0]
-                logging.info(f"Found pod {osd_removal_pod_name}")
+                logger.info(f"Found pod {osd_removal_pod_name}")
                 return osd_removal_pod_name
 
     except TimeoutExpiredError:
@@ -1859,8 +1900,14 @@ def verify_osd_removal_job_completed_successfully(osd_id):
     # Verify OSD removal from the ocs-osd-removal pod logs
     logger.info(f"Verifying removal of OSD from {osd_removal_pod_name} pod logs")
     logs = get_pod_logs(osd_removal_pod_name)
-    pattern = f"purged osd.{osd_id}"
-    if not re.search(pattern, logs):
+    patterns = [
+        f"purged osd.{osd_id}",
+        f"purge osd.{osd_id}",
+        f"completed removal of OSD {osd_id}",
+    ]
+
+    is_osd_pattern_in_logs = any([re.search(pattern, logs) for pattern in patterns])
+    if not is_osd_pattern_in_logs:
         logger.warning(
             f"Didn't find the removal of OSD from {osd_removal_pod_name} pod logs"
         )
@@ -2136,7 +2183,7 @@ def wait_for_change_in_pods_statuses(
                     )
                     return True
     except TimeoutExpiredError:
-        logging.info(f"The status of the pods did not change after {timeout} seconds")
+        logger.info(f"The status of the pods did not change after {timeout} seconds")
         return False
 
 

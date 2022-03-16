@@ -22,7 +22,10 @@ from ocs_ci.ocs.constants import (
     IBM_POWER_PLATFORM,
     IBMCLOUD_PLATFORM,
     ROSA_PLATFORM,
+    OPENSHIFT_DEDICATED_PLATFORM,
+    MANAGED_SERVICE_PLATFORMS,
 )
+from ocs_ci.utility import version
 from ocs_ci.utility.aws import update_config_from_s3
 from ocs_ci.utility.utils import load_auth_config
 
@@ -58,6 +61,7 @@ csi = pytest.mark.csi
 monitoring = pytest.mark.monitoring
 workloads = pytest.mark.workloads
 flowtests = pytest.mark.flowtests
+system_test = pytest.mark.system_test
 performance = pytest.mark.performance
 performance_extended = pytest.mark.performance_extended
 scale = pytest.mark.scale
@@ -66,6 +70,7 @@ scale_changed_layout = pytest.mark.scale_changed_layout
 deployment = pytest.mark.deployment
 polarion_id = pytest.mark.polarion_id
 bugzilla = pytest.mark.bugzilla
+acm_import = pytest.mark.acm_import
 
 tier_marks = [
     tier1,
@@ -143,6 +148,13 @@ aws_platform_required = pytest.mark.skipif(
     reason="Test runs ONLY on AWS deployed cluster",
 )
 
+aws_based_platform_required = pytest.mark.skipif(
+    (
+        config.ENV_DATA["platform"].lower() != "aws"
+        and config.ENV_DATA["platform"].lower() != ROSA_PLATFORM
+    ),
+    reason="Test runs ONLY on AWS based deployed cluster",
+)
 azure_platform_required = pytest.mark.skipif(
     config.ENV_DATA["platform"].lower() != "azure",
     reason="Test runs ONLY on Azure deployed cluster",
@@ -190,6 +202,32 @@ ipi_deployment_required = pytest.mark.skipif(
     reason="Test runs ONLY on IPI deployed cluster",
 )
 
+managed_service_required = pytest.mark.skipif(
+    (config.ENV_DATA["platform"].lower() not in MANAGED_SERVICE_PLATFORMS),
+    reason="Test runs ONLY on OSD or ROSA cluster",
+)
+
+ms_provider_required = pytest.mark.skipif(
+    not (
+        config.ENV_DATA["platform"].lower() in MANAGED_SERVICE_PLATFORMS
+        and config.ENV_DATA["cluster_type"].lower() == "provider"
+    ),
+    reason="Test runs ONLY on managed service provider cluster",
+)
+
+ms_consumer_required = pytest.mark.skipif(
+    not (
+        config.ENV_DATA["platform"].lower() in MANAGED_SERVICE_PLATFORMS
+        and config.ENV_DATA["cluster_type"].lower() == "consumer"
+    ),
+    reason="Test runs ONLY on managed service consumer cluster",
+)
+
+kms_config_required = pytest.mark.skipif(
+    load_auth_config().get("vault", {}).get("VAULT_ADDR") is None,
+    reason="Vault config not found in auth.yaml",
+)
+
 skipif_aws_i3 = pytest.mark.skipif(
     config.ENV_DATA["platform"].lower() == "aws"
     and config.DEPLOYMENT.get("local_storage") is True,
@@ -208,9 +246,26 @@ skipif_bmpsi = pytest.mark.skipif(
     reason="Test will not run on Baremetal PSI",
 )
 
+skipif_managed_service = pytest.mark.skipif(
+    config.ENV_DATA["platform"].lower() in MANAGED_SERVICE_PLATFORMS,
+    reason="Test will not run on Managed service cluster",
+)
+
 skipif_openshift_dedicated = pytest.mark.skipif(
-    config.ENV_DATA["platform"].lower() == "openshiftdedicated",
+    config.ENV_DATA["platform"].lower() == OPENSHIFT_DEDICATED_PLATFORM,
     reason="Test will not run on Openshift dedicated cluster",
+)
+
+skipif_ms_provider = pytest.mark.skipif(
+    config.ENV_DATA["platform"].lower() in MANAGED_SERVICE_PLATFORMS
+    and config.ENV_DATA["cluster_type"].lower() == "provider",
+    reason="Test will not run on Managed service provider cluster",
+)
+
+skipif_ms_consumer = pytest.mark.skipif(
+    config.ENV_DATA["platform"].lower() in MANAGED_SERVICE_PLATFORMS
+    and config.ENV_DATA["cluster_type"].lower() == "consumer",
+    reason="Test will not run on Managed service consumer cluster",
 )
 
 skipif_rosa = pytest.mark.skipif(
@@ -273,7 +328,7 @@ skipif_flexy_deployment = pytest.mark.skipif(
 )
 
 metrics_for_external_mode_required = pytest.mark.skipif(
-    float(config.ENV_DATA["ocs_version"]) < 4.6
+    version.get_semantic_ocs_version_from_config() < version.VERSION_4_6
     and config.DEPLOYMENT.get("external_mode") is True,
     reason="Metrics is not enabled for external mode OCS <4.6",
 )
@@ -306,3 +361,19 @@ skipif_upgraded_from = pytest.mark.skipif_upgraded_from
 # Marker for skipping tests if the cluster doesn't have configured cluster-wide
 # encryption with KMS properly
 skipif_no_kms = pytest.mark.skipif_no_kms
+
+skipif_ibm_flash = pytest.mark.skipif(
+    config.ENV_DATA.get("ibm_flash"),
+    reason="This test doesn't work correctly on IBM Flash system",
+)
+
+# Squad marks
+black_squad = pytest.mark.black_squad
+blue_squad = pytest.mark.blue_squad
+brown_squad = pytest.mark.brown_squad
+green_squad = pytest.mark.green_squad
+grey_squad = pytest.mark.grey_squad
+magenta_squad = pytest.mark.magenta_squad
+orange_squad = pytest.mark.orange_squad
+purple_squad = pytest.mark.purple_squad
+red_squad = pytest.mark.red_squad

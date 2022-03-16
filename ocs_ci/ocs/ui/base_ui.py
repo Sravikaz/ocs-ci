@@ -9,7 +9,9 @@ from selenium import webdriver
 from selenium.common.exceptions import (
     TimeoutException,
     WebDriverException,
+    NoSuchElementException,
 )
+from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
@@ -26,16 +28,20 @@ from ocs_ci.ocs import constants
 from ocs_ci.ocs.exceptions import (
     NotSupportedProxyConfiguration,
     TimeoutExpiredError,
+    PageNotLoaded,
 )
+from ocs_ci.ocs.ui.views import OCS_OPERATOR, ODF_OPERATOR
+from ocs_ci.ocs.ocp import get_ocp_url
 from ocs_ci.ocs.ui.views import locators
 from ocs_ci.utility.templating import Templating
 from ocs_ci.utility.retry import retry
+from ocs_ci.utility import version
 from ocs_ci.utility.utils import (
     TimeoutSampler,
     get_kubeadmin_password,
     get_ocp_version,
-    run_cmd,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +52,7 @@ class BaseUI:
 
     """
 
-    def __init__(self, driver):
+    def __init__(self, driver: WebDriver):
         self.driver = driver
         self.screenshots_folder = os.path.join(
             os.path.expanduser(ocsci_config.RUN["log_dir"]),
@@ -56,12 +62,6 @@ class BaseUI:
         if not os.path.isdir(self.screenshots_folder):
             Path(self.screenshots_folder).mkdir(parents=True, exist_ok=True)
         logger.info(f"screenshots pictures:{self.screenshots_folder}")
-        if config.ENV_DATA["platform"].lower() == constants.VSPHERE_PLATFORM:
-            self.storage_class = "thin_sc"
-        elif config.ENV_DATA["platform"].lower() == constants.AWS_PLATFORM:
-            self.storage_class = "gp2_sc"
-        elif config.ENV_DATA["platform"].lower() == constants.AZURE_PLATFORM:
-            self.storage_class = "managed-premium_sc"
 
     def do_click(self, locator, timeout=30, enable_screenshot=False):
         """
@@ -178,6 +178,57 @@ class BaseUI:
         )
         return len(element_list) > 0
 
+    def get_element_text(self, locator):
+        """
+        Get the inner text of an element in locator.
+
+        Args:
+            locator (set): (GUI element needs to operate on (str), type (By)).
+
+        Return:
+            str: The text captured.
+        """
+        return self.driver.find_element(by=locator[1], value=locator[0]).text
+
+    def page_has_loaded(self, retries=5, sleep_time=1):
+        """
+        Waits for page to completely load by comparing current page hash values.
+        Not suitable for pages that use frequent dynamically content (less than sleep_time)
+
+        Args:
+            retries (int): How much time in sleep_time to wait for page to load
+            sleep_time (int): Time to wait between every pool of dom hash
+
+        """
+
+        def get_page_hash():
+            """
+            Get dom html hash
+            """
+            dom = self.driver.find_element_by_tag_name("html").get_attribute(
+                "innerHTML"
+            )
+            dom_hash = hash(dom.encode("utf-8"))
+            return dom_hash
+
+        page_hash = "empty"
+        page_hash_new = ""
+
+        # comparing old and new page DOM hash together to verify the page is fully loaded
+        retry_counter = 0
+        while page_hash != page_hash_new:
+            if retry_counter > 0:
+                logger.info(f"page not loaded yet: {self.driver.current_url}")
+            retry_counter += 1
+            page_hash = get_page_hash()
+            time.sleep(sleep_time)
+            page_hash_new = get_page_hash()
+            if retry_counter == retries:
+                raise PageNotLoaded(
+                    f"Current URL did not finish loading in {retries*sleep_time}"
+                )
+        logger.info(f"page loaded: {self.driver.current_url}")
+
     def refresh_page(self):
         """
         Refresh Web Page
@@ -232,7 +283,7 @@ class BaseUI:
             expected_text (str): Text which needs to be searched on UI
             timeout (int): Looks for a web element repeatedly until timeout (sec) occurs
 
-        return:
+        Returns:
             bool: Returns True if the expected element text is found, False otherwise
 
         """
@@ -250,9 +301,30 @@ class BaseUI:
             return True
         except TimeoutException:
             self.take_screenshot()
-            logger.error(
+            logger.warning(
                 f"Locator {locator[1]} {locator[0]} did not find text {expected_text}"
             )
+            return False
+
+    def check_element_presence(self, locator, timeout=5):
+        """
+        Check if an web element is present on the web console or not.
+
+
+        Args:
+             locator (tuple): (GUI element needs to operate on (str), type (By))
+             timeout (int): Looks for a web element repeatedly until timeout (sec) occurs
+        Returns:
+            bool: True if the element is found, returns False otherwise and raises NoSuchElementException
+
+        """
+        try:
+            wait = WebDriverWait(self.driver, timeout=timeout, poll_frequency=1)
+            wait.until(ec.presence_of_element_located(locator))
+            return True
+        except NoSuchElementException:
+            self.take_screenshot()
+            logger.error("Expected element not found on UI")
             return False
 
 
@@ -265,9 +337,29 @@ class PageNavigator(BaseUI):
     def __init__(self, driver):
         super().__init__(driver)
         self.ocp_version = get_ocp_version()
+        self.ocp_version_full = version.get_semantic_ocp_version_from_config()
         self.page_nav = locators[self.ocp_version]["page"]
+        self.ocs_version_semantic = version.get_semantic_ocs_version_from_config()
+        self.ocp_version_semantic = version.get_semantic_ocp_version_from_config()
+        self.operator_name = (
+            ODF_OPERATOR
+            if self.ocs_version_semantic >= version.VERSION_4_9
+            else OCS_OPERATOR
+        )
         if Version.coerce(self.ocp_version) >= Version.coerce("4.8"):
             self.generic_locators = locators[self.ocp_version]["generic"]
+        if config.ENV_DATA["platform"].lower() == constants.VSPHERE_PLATFORM:
+            self.storage_class = "thin_sc"
+        elif config.ENV_DATA["platform"].lower() == constants.AWS_PLATFORM:
+            aws_sc = config.DEPLOYMENT.get("customized_deployment_storage_class")
+            if aws_sc == "gp3-csi":
+                self.storage_class = "gp3-csi_sc"
+            elif aws_sc == "gp2-csi":
+                self.storage_class = "gp2-csi_sc"
+            else:
+                self.storage_class = "gp2_sc"
+        elif config.ENV_DATA["platform"].lower() == constants.AZURE_PLATFORM:
+            self.storage_class = "managed-premium_sc"
 
     def navigate_overview_page(self):
         """
@@ -281,6 +373,17 @@ class PageNavigator(BaseUI):
         else:
             self.choose_expanded_mode(mode=True, locator=self.page_nav["Home"])
         self.do_click(locator=self.page_nav["overview_page"])
+
+    def navigate_odf_overview_page(self):
+        """
+        Navigate to OpenShift Data Foundation Overview Page
+
+        """
+        logger.info("Navigate to ODF tab under Storage section")
+        self.choose_expanded_mode(mode=True, locator=self.page_nav["Storage"])
+        self.do_click(locator=self.page_nav["odf_tab"], timeout=90)
+        self.page_has_loaded(retries=15)
+        logger.info("Successfully navigated to ODF tab under Storage section")
 
     def navigate_quickstarts_page(self):
         """
@@ -349,6 +452,10 @@ class PageNavigator(BaseUI):
         self.do_click(
             self.page_nav["installed_operators_page"], enable_screenshot=False
         )
+        self.page_has_loaded(retries=25)
+        if self.ocp_version_full >= version.VERSION_4_9:
+            self.do_click(self.page_nav["drop_down_projects"])
+            self.do_click(self.page_nav["choose_all_projects"])
 
     def navigate_to_ocs_operator_page(self):
         """
@@ -493,6 +600,15 @@ class PageNavigator(BaseUI):
         self.choose_expanded_mode(mode=True, locator=self.page_nav["Workloads"])
         self.do_click(locator=self.page_nav["Pods"], enable_screenshot=False)
 
+    def navigate_block_pool_page(self):
+        """
+        Navigate to block pools page
+
+        """
+        logger.info("Navigate to block pools page")
+        self.navigate_to_ocs_operator_page()
+        self.do_click(locator=self.page_nav["block_pool_link"])
+
     def verify_current_page_resource_status(self, status_to_check, timeout=30):
         """
         Compares a given status string to the one shown in the resource's UI page
@@ -559,19 +675,21 @@ def take_screenshot(driver):
 
 @retry(TimeoutException, tries=3, delay=3, backoff=2)
 @retry(WebDriverException, tries=3, delay=3, backoff=2)
-def login_ui():
+def login_ui(console_url=None):
     """
     Login to OpenShift Console
+
+    Args:
+        console_url (str): ocp console url
 
     return:
         driver (Selenium WebDriver)
 
     """
-    logger.info("Get URL of OCP console")
-    console_url = run_cmd(
-        "oc get consoles.config.openshift.io cluster -o"
-        "jsonpath='{.status.consoleURL}'"
-    )
+    default_console = False
+    if not console_url:
+        console_url = get_ocp_url()
+        default_console = True
     logger.info("Get password of OCP console")
     password = get_kubeadmin_password()
     password = password.rstrip()
@@ -589,6 +707,9 @@ def login_ui():
             chrome_options.add_argument("--ignore-ssl-errors=yes")
             chrome_options.add_argument("--ignore-certificate-errors")
             chrome_options.add_argument("--allow-insecure-localhost")
+            if config.ENV_DATA.get("import_clusters_to_acm"):
+                # Dev shm should be disabled when sending big amonut characters, like the cert sections of a kubeconfig
+                chrome_options.add_argument("--disable-dev-shm-usage")
             capabilities = chrome_options.to_capabilities()
             capabilities["acceptInsecureCerts"] = True
 
@@ -655,11 +776,16 @@ def login_ui():
     wait = WebDriverWait(driver, 60)
     driver.maximize_window()
     driver.get(console_url)
-    if config.ENV_DATA["flexy_deployment"]:
+    if config.ENV_DATA.get("flexy_deployment") or config.ENV_DATA.get(
+        "import_clusters_to_acm"
+    ):
         try:
             element = wait.until(
                 ec.element_to_be_clickable(
-                    (login_loc["flexy_kubeadmin"][1], login_loc["flexy_kubeadmin"][0])
+                    (
+                        login_loc["kubeadmin_login_approval"][1],
+                        login_loc["kubeadmin_login_approval"][0],
+                    )
                 )
             )
             element.click()
@@ -681,7 +807,8 @@ def login_ui():
         )
     )
     element.click()
-    WebDriverWait(driver, 60).until(ec.title_is(login_loc["ocp_page"]))
+    if default_console:
+        WebDriverWait(driver, 60).until(ec.title_is(login_loc["ocp_page"]))
     return driver
 
 

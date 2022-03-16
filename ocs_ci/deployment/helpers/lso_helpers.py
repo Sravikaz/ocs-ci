@@ -6,19 +6,17 @@ LSO ( local storage operator ) deployment.
 import json
 import logging
 import tempfile
-import time
 
 from ocs_ci.deployment.disconnected import prune_and_mirror_index_image
 from ocs_ci.framework import config
 from ocs_ci.ocs import constants, ocp, defaults
 from ocs_ci.ocs.exceptions import CommandFailed, UnsupportedPlatformError
 from ocs_ci.ocs.node import get_nodes, get_compute_node_names
-from ocs_ci.utility import templating
+from ocs_ci.utility import templating, version
 from ocs_ci.utility.deployment import get_ocp_ga_version
 from ocs_ci.utility.localstorage import get_lso_channel
 from ocs_ci.utility.retry import retry
 from ocs_ci.utility.utils import (
-    get_ocp_version,
     run_cmd,
     wait_for_machineconfigpool_status,
 )
@@ -41,8 +39,8 @@ def setup_local_storage(storageclass):
     worker_names = [worker.name for worker in workers]
     logger.debug("Workers: %s", worker_names)
 
-    ocp_version = get_ocp_version()
-    ocs_version = config.ENV_DATA.get("ocs_version")
+    ocp_version = version.get_semantic_ocp_version_from_config()
+    ocs_version = version.get_semantic_ocs_version_from_config()
     ocp_ga_version = get_ocp_ga_version(ocp_version)
     if not ocp_ga_version:
         optional_operators_data = list(
@@ -89,8 +87,6 @@ def setup_local_storage(storageclass):
         )
         run_cmd(f"oc create -f {optional_operators_yaml.name}")
         logger.info("Sleeping for 60 sec to start update machineconfigpool status")
-        # sleep here to start update machineconfigpool status
-        time.sleep(60)
         wait_for_machineconfigpool_status("all")
 
     logger.info("Retrieving local-storage-operator data from yaml")
@@ -146,7 +142,7 @@ def setup_local_storage(storageclass):
     if platform == constants.RHV_PLATFORM:
         add_disk_for_rhv_platform()
 
-    if (ocp_version >= "4.6") and (ocs_version >= "4.6"):
+    if (ocp_version >= version.VERSION_4_6) and (ocs_version >= version.VERSION_4_6):
         # Pull local volume discovery yaml data
         logger.info("Pulling LocalVolumeDiscovery CR data from yaml")
         lvd_data = templating.load_yaml(constants.LOCAL_VOLUME_DISCOVERY_YAML)
@@ -202,6 +198,10 @@ def setup_local_storage(storageclass):
             "Updating LocalVolumeSet CR data with LSO storageclass: %s", storageclass
         )
         lvs_data["spec"]["storageClassName"] = storageclass
+
+        # set volumeMode to Filesystem for MCG only deployment
+        if config.ENV_DATA["mcg_only_deployment"]:
+            lvs_data["spec"]["volumeMode"] = constants.VOLUME_MODE_FILESYSTEM
 
         lvs_data_yaml = tempfile.NamedTemporaryFile(
             mode="w+", prefix="local_volume_set", delete=False

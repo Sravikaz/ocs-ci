@@ -9,6 +9,8 @@ from ocs_ci.framework.testlib import (
     skipif_ocs_version,
     skipif_disconnected_cluster,
     tier1,
+    skipif_ui_not_support,
+    ui,
 )
 from ocs_ci.ocs.ocp import OCP, get_all_resource_names_of_a_kind
 from ocs_ci.ocs.ui.mcg_ui import BucketClassUI, MCGStoreUI, ObcUI
@@ -16,6 +18,7 @@ from ocs_ci.ocs.ui.mcg_ui import BucketClassUI, MCGStoreUI, ObcUI
 logger = logging.getLogger(__name__)
 
 
+@skipif_ui_not_support("mcg_stores")
 class TestStoreUserInterface(object):
     """
     Test the MCG store UI
@@ -34,6 +37,7 @@ class TestStoreUserInterface(object):
                     kind=store_kind, namespace=config.ENV_DATA["cluster_namespace"]
                 ).delete(resource_name=store_name)
 
+    @ui
     @tier1
     @skipif_ocs_version("!=4.8")
     @skipif_disconnected_cluster
@@ -84,6 +88,8 @@ class TestStoreUserInterface(object):
         assert test_store.check_resource_existence(should_exist=False)
 
 
+@ui
+@skipif_ui_not_support("bucketclass")
 @tier1
 @skipif_ocs_version("!=4.8")
 @skipif_disconnected_cluster
@@ -217,6 +223,7 @@ class TestBucketclassUserInterface(object):
         assert test_bc.check_resource_existence(should_exist=False)
 
 
+@skipif_ui_not_support("obc")
 class TestObcUserInterface(object):
     """
     Test the object bucket claim UI
@@ -231,6 +238,7 @@ class TestObcUserInterface(object):
                 resource_name=obc_name
             )
 
+    @ui
     @tier1
     @skipif_ocs_version("!=4.8")
     @pytest.mark.parametrize(

@@ -20,8 +20,7 @@ from ocs_ci.framework.testlib import (
     skipif_ocs_version,
     tier1,
     tier2,
-    tier4,
-    tier4a,
+    tier4c,
 )
 from ocs_ci.ocs.bucket_utils import (
     sync_object_directory,
@@ -36,13 +35,13 @@ from ocs_ci.ocs import constants, bucket_utils
 from ocs_ci.ocs.cluster import CephCluster
 from ocs_ci.ocs.exceptions import CommandFailed, UnexpectedBehaviour
 from ocs_ci.ocs.resources import pod
-from ocs_ci.framework.pytest_customization.marks import skipif_openshift_dedicated
+from ocs_ci.framework.pytest_customization.marks import skipif_managed_service
 from ocs_ci.ocs.resources.bucket_policy import HttpResponseParser
 
 logger = logging.getLogger(__name__)
 
 
-@skipif_openshift_dedicated
+@skipif_managed_service
 @skipif_aws_creds_are_missing
 @skipif_ocs_version("<4.7")
 class TestNamespace(MCGTest):
@@ -928,8 +927,7 @@ class TestNamespace(MCGTest):
             amount=3,
         )
 
-    @tier4
-    @tier4a
+    @tier4c
     @pytest.mark.parametrize(
         argnames=["mcg_pod"],
         argvalues=[
@@ -1023,8 +1021,7 @@ class TestNamespace(MCGTest):
         )
 
     @pytest.mark.polarion_id("OCS-2293")
-    @tier4
-    @tier4a
+    @tier2
     def test_namespace_bucket_creation_with_many_resources_crd(
         self, namespace_store_factory, bucket_factory
     ):
@@ -1052,8 +1049,7 @@ class TestNamespace(MCGTest):
         )
 
     @pytest.mark.polarion_id("OCS-2325")
-    @tier4
-    @tier4a
+    @tier2
     def test_block_read_resource_in_namespace_bucket_crd(
         self,
         mcg_obj,
@@ -1061,6 +1057,7 @@ class TestNamespace(MCGTest):
         namespace_store_factory,
         bucket_factory,
         cld_mgr,
+        test_directory_setup,
     ):
         """
         Test blocking namespace resource in namespace bucket.
@@ -1079,11 +1076,15 @@ class TestNamespace(MCGTest):
         ns_store1 = namespace_store_factory(*nss_tup)[0]
         ns_store2 = namespace_store_factory(*nss_tup)[0]
 
+        original_folder = test_directory_setup.origin_dir
+        result_folder = test_directory_setup.result_dir
+
         logger.info("Upload files to NS resources")
         self.write_files_to_pod_and_upload(
             mcg_obj,
             awscli_pod_session,
             bucket_to_write=ns_store1.uls_name,
+            original_dir=original_folder,
             amount=3,
             s3_creds=s3_creds,
         )
@@ -1091,6 +1092,7 @@ class TestNamespace(MCGTest):
             mcg_obj,
             awscli_pod_session,
             bucket_to_write=ns_store2.uls_name,
+            original_dir=original_folder,
             amount=2,
             s3_creds=s3_creds,
         )
@@ -1115,7 +1117,12 @@ class TestNamespace(MCGTest):
 
         logger.info("Read files directly from AWS")
         try:
-            self.download_files(mcg_obj, awscli_pod_session, bucket_to_read=ns_bucket)
+            self.download_files(
+                mcg_obj,
+                awscli_pod_session,
+                bucket_to_read=ns_bucket,
+                download_dir=result_folder,
+            )
         except CommandFailed:
             logger.info("Attempt to read files failed as expected")
             logger.info("Bring ns_store1 up")

@@ -10,7 +10,7 @@ from shutil import rmtree
 import time
 
 import tempfile
-import hcl
+import hcl2
 import yaml
 
 from ocs_ci.deployment.helpers.vsphere_helpers import VSPHEREHELPERS
@@ -27,8 +27,9 @@ from ocs_ci.ocs.node import (
     remove_nodes,
     wait_for_nodes_status,
 )
-from ocs_ci.utility import templating
+from ocs_ci.utility import templating, version
 from ocs_ci.ocs.openshift_ops import OCP
+from ocs_ci.ocs.resources import pod
 from ocs_ci.utility.aws import AWS
 from ocs_ci.utility.bootstrap import gather_bootstrap
 from ocs_ci.utility.csr import approve_pending_csr, wait_for_all_nodes_csr_and_approve
@@ -49,13 +50,13 @@ from ocs_ci.utility.utils import (
     run_cmd,
     upload_file,
     wait_for_co,
+    get_infra_id,
     get_ocp_version,
     get_openshift_installer,
     get_terraform,
     set_aws_region,
     get_terraform_ignition_provider,
     get_ocp_upgrade_history,
-    load_auth_config,
     add_chrony_to_ocp_deployment,
 )
 from ocs_ci.utility.vsphere import VSPHERE as VSPHEREUtil
@@ -108,6 +109,7 @@ class VSPHEREBASE(Deployment):
             vsphere_prechecks.get_all_checks()
 
         self.ocp_version = get_ocp_version()
+        config.ENV_DATA["ocp_version"] = self.ocp_version
 
         self.wait_time = 90
 
@@ -304,7 +306,8 @@ class VSPHEREBASE(Deployment):
             )
 
         # destroy the folder in templates
-        self.vsphere.destroy_folder(pool, self.cluster, self.datacenter)
+        template_folder = get_infra_id(self.cluster_path)
+        self.vsphere.destroy_folder(template_folder, self.cluster, self.datacenter)
 
         # remove .terraform directory ( this is only to reclaim space )
         terraform_plugins_dir = os.path.join(
@@ -417,6 +420,9 @@ class VSPHEREUPI(VSPHEREBASE):
             # generate terraform variable file
             generate_terraform_vars_and_update_machine_conf()
 
+            # Add shutdown_wait_timeout to VM's
+            add_shutdown_wait_timeout()
+
             # sync guest time with host
             vm_file = (
                 constants.VM_MAIN
@@ -445,6 +451,10 @@ class VSPHEREUPI(VSPHEREBASE):
 
             # Parse the rendered YAML so that we can manipulate the object directly
             install_config_obj = yaml.safe_load(install_config_str)
+            if version.get_semantic_ocp_version_from_config() >= version.VERSION_4_10:
+                install_config_obj["platform"]["vsphere"]["network"] = config.ENV_DATA[
+                    "vm_network"
+                ]
             install_config_obj["pullSecret"] = self.get_pull_secret()
             install_config_obj["sshKey"] = self.get_ssh_key()
             install_config_str = yaml.safe_dump(install_config_obj)
@@ -540,6 +550,7 @@ class VSPHEREUPI(VSPHEREBASE):
                 # remove bootstrap IP in load balancer and
                 # restart haproxy
                 lb = LoadBalancer()
+                lb.rename_haproxy_conf_and_reload()
                 lb.remove_boostrap_in_proxy()
                 lb.restart_haproxy()
 
@@ -706,13 +717,31 @@ class VSPHEREUPI(VSPHEREBASE):
         )
 
         clone_openshift_installer()
-        if os.path.exists(f"{constants.VSPHERE_MAIN}.backup") and os.path.exists(
-            f"{constants.VSPHERE_MAIN}.json"
-        ):
-            os.rename(
-                f"{constants.VSPHERE_MAIN}.json",
-                f"{constants.VSPHERE_MAIN}.json.backup",
-            )
+        rename_files = [constants.VSPHERE_MAIN, constants.VM_MAIN]
+        for each_file in rename_files:
+            if os.path.exists(f"{each_file}.backup") and os.path.exists(
+                f"{each_file}.json"
+            ):
+                os.rename(
+                    f"{each_file}.json",
+                    f"{each_file}.json.backup",
+                )
+
+        # change the keep_on_remove state to false
+        terraform_tfstate = os.path.join(terraform_data_dir, "terraform.tfstate")
+        str_to_modify = '"keep_on_remove": true,'
+        target_str = '"keep_on_remove": false,'
+        logger.debug(f"changing state from {str_to_modify} to {target_str}")
+        replace_content_in_file(terraform_tfstate, str_to_modify, target_str)
+
+        # remove csi users in case of external deployment
+        if config.DEPLOYMENT["external_mode"]:
+            logger.debug("deleting csi users")
+            toolbox = pod.get_ceph_tools_pod()
+            toolbox.exec_cmd_on_pod("ceph auth del client.csi-cephfs-node")
+            toolbox.exec_cmd_on_pod("ceph auth del client.csi-cephfs-provisioner")
+            toolbox.exec_cmd_on_pod("ceph auth del client.csi-rbd-node")
+            toolbox.exec_cmd_on_pod("ceph auth del client.csi-rbd-provisioner")
 
         # terraform initialization and destroy cluster
         terraform = Terraform(os.path.join(upi_repo_path, "upi/vsphere/"))
@@ -809,7 +838,6 @@ class VSPHEREIPI(VSPHEREBASE):
     class OCPDeployment(BaseOCPDeployment):
         def __init__(self):
             super(VSPHEREIPI.OCPDeployment, self).__init__()
-            self.ipi_details = load_auth_config()["vmware_ipi"]
 
         def deploy_prereq(self):
             """
@@ -1059,7 +1087,7 @@ def change_mem_and_cpu():
     master_memory = config.ENV_DATA.get("master_memory")
     if worker_num_cpus or master_num_cpus or master_memory or worker_memory:
         with open(constants.VSPHERE_MAIN, "r") as fd:
-            obj = hcl.load(fd)
+            obj = hcl2.load(fd)
             if worker_num_cpus:
                 obj["module"]["compute"]["num_cpu"] = worker_num_cpus
             if master_num_cpus:
@@ -1088,6 +1116,24 @@ def update_gw(str_to_replace, config_file):
         replace_content_in_file(
             config_file, str_to_replace, f"{config.ENV_DATA.get('gateway')}"
         )
+
+
+def add_shutdown_wait_timeout():
+    """
+    Add shutdown_wait_timeout to VM's
+
+    shutdown_wait_timeout is the amount of time, in minutes, to wait for a graceful guest shutdown
+    when making necessary updates to the virtual machine. If force_power_off is set to true, the VM will be
+    force powered-off after this timeout, otherwise an error is returned. Default: 3 minutes.
+
+    """
+    with open(constants.VM_MAIN, "r") as fd:
+        obj = hcl2.load(fd)
+        obj["resource"][0]["vsphere_virtual_machine"]["vm"][
+            "shutdown_wait_timeout"
+        ] = 10
+    dump_data_to_json(obj, f"{constants.VM_MAIN}.json")
+    os.rename(constants.VM_MAIN, f"{constants.VM_MAIN}.backup")
 
 
 def update_dns():

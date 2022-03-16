@@ -453,7 +453,9 @@ class OCP(object):
         # if on Proxy environment and if ENV_DATA["client_http_proxy"] is
         # defined, update kubeconfig file with proxy-url parameter to redirect
         # client access through proxy server
-        if config.DEPLOYMENT.get("proxy") and config.ENV_DATA.get("client_http_proxy"):
+        if (
+            config.DEPLOYMENT.get("proxy") or config.DEPLOYMENT.get("disconnected")
+        ) and config.ENV_DATA.get("client_http_proxy"):
             kubeconfig = os.getenv("KUBECONFIG")
             if not kubeconfig or not os.path.exists(kubeconfig):
                 kubeconfig = os.path.join(
@@ -770,11 +772,7 @@ class OCP(object):
         # https://github.com/red-hat-storage/ocs-ci/issues/2312
         try:
             if self.data["items"][0]["kind"].lower() == "build" and (
-                self.data["items"][0]
-                .get("metadata")
-                .get("annotations")
-                .get("openshift.io/build-config.name")
-                == "jax-rs-build"
+                "jax-rs-build" in self.data["items"][0].get("metadata").get("name")
             ):
                 return resource_info[column_index - 1]
         except Exception:
@@ -1021,6 +1019,23 @@ def get_all_resource_names_of_a_kind(kind):
     ]
 
 
+def get_all_resource_of_kind_containing_string(search_string, kind):
+    """
+    Return all the resource of kind which name contain search_string
+    Args:
+         search_string (str): The string to search in name of the resource
+         kind (str): Kind of the resource to search for
+    Returns:
+        (list): List of resource
+    """
+
+    resource_list = []
+    for resource in OCP(kind=kind).get().get("items"):
+        if search_string in resource["metadata"]["name"]:
+            resource_list.append(resource)
+    return resource_list
+
+
 def get_clustername():
     """
     Return the name (DNS short name) of the cluster
@@ -1032,39 +1047,6 @@ def get_clustername():
 
     ocp_cluster = OCP(namespace="openshift-console", kind="", resource_name="route")
     return ocp_cluster.get()["items"][0]["spec"]["host"].split(".")[2]
-
-
-def get_ocs_version():
-    """
-    Return the OCS Version
-
-    Returns:
-         str: The version of the OCS
-
-    """
-
-    ocp_cluster = OCP(
-        namespace=config.ENV_DATA["cluster_namespace"], kind="", resource_name="csv"
-    )
-    for item in ocp_cluster.get()["items"]:
-        if item["metadata"]["name"].startswith("ocs-operator"):
-            return item["spec"]["version"]
-
-
-def get_ocs_parsed_version():
-    """
-    Returns ocs version as float
-
-    Returns:
-        float: ocs version number as major.minor (for example: 4.5)
-
-    """
-    ocs_ver = get_ocs_version().split("-")
-    major_minor = ocs_ver[0].split(".")
-    major = major_minor[0]
-    minor = major_minor[1]
-
-    return float(f"{major}.{minor}")
 
 
 def get_build():
@@ -1503,3 +1485,21 @@ def get_services_by_label(label, namespace):
     ocp_svc = OCP(kind=constants.SERVICE, namespace=namespace)
     svc = ocp_svc.get(selector=label).get("items")
     return svc
+
+
+def get_ocp_url():
+    """
+    Getting default URL for OCP console
+    Returns:
+        str: OCP console URL
+
+    """
+    oc_cmd = OCP(namespace=config.ENV_DATA["cluster_namespace"])
+    log.info("Get URL of OCP console")
+    url = oc_cmd.exec_oc_cmd(
+        "get consoles.config.openshift.io cluster -o" "jsonpath='{.status.consoleURL}'",
+        out_yaml_format=False,
+    )
+    log.info(f"OCP URL: {url}")
+
+    return str(url)

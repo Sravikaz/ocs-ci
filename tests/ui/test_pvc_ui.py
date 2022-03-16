@@ -1,13 +1,10 @@
 import logging
 import pytest
 
-from ocs_ci.framework.testlib import tier1, skipif_ui_not_support
+from ocs_ci.framework.testlib import tier1, skipif_ui_not_support, ui
 from ocs_ci.ocs.ui.pvc_ui import PvcUI
-from ocs_ci.framework.testlib import (
-    skipif_ocs_version,
-    skipif_ocp_version,
-)
-from ocs_ci.ocs.resources.pvc import get_all_pvc_objs
+from ocs_ci.framework.testlib import skipif_ocs_version
+from ocs_ci.ocs.resources.pvc import get_all_pvc_objs, get_pvc_objs
 from ocs_ci.ocs import constants
 from ocs_ci.helpers import helpers
 from ocs_ci.helpers.helpers import wait_for_resource_state, create_unique_resource_name
@@ -18,6 +15,9 @@ from ocs_ci.ocs.resources.pod import get_fio_rw_iops
 logger = logging.getLogger(__name__)
 
 
+@ui
+@skipif_ocs_version("<4.6")
+@skipif_ui_not_support("pvc")
 class TestPvcUserInterface(object):
     """
     Test PVC User Interface
@@ -25,8 +25,6 @@ class TestPvcUserInterface(object):
     """
 
     @tier1
-    @skipif_ocs_version("<4.6")
-    @skipif_ui_not_support("pvc")
     @pytest.mark.parametrize(
         argnames=["sc_name", "access_mode", "pvc_size", "vol_mode"],
         argvalues=[
@@ -43,13 +41,6 @@ class TestPvcUserInterface(object):
                 "Block",
             ),
             pytest.param(
-                "ocs-storagecluster-ceph-rbd-thick",
-                "ReadWriteMany",
-                "4",
-                "Block",
-                marks=[skipif_ocp_version("<4.9")],
-            ),
-            pytest.param(
                 "ocs-storagecluster-cephfs",
                 "ReadWriteOnce",
                 "10",
@@ -62,24 +53,10 @@ class TestPvcUserInterface(object):
                 "Block",
             ),
             pytest.param(
-                "ocs-storagecluster-ceph-rbd-thick",
-                "ReadWriteOnce",
-                "12",
-                "Block",
-                marks=[skipif_ocp_version("<4.9")],
-            ),
-            pytest.param(
                 "ocs-storagecluster-ceph-rbd",
                 "ReadWriteOnce",
                 "13",
                 "Filesystem",
-            ),
-            pytest.param(
-                "ocs-storagecluster-ceph-rbd-thick",
-                "ReadWriteOnce",
-                "4",
-                "Filesystem",
-                marks=[skipif_ocp_version("<4.9")],
             ),
         ],
     )
@@ -146,10 +123,7 @@ class TestPvcUserInterface(object):
 
         # Creating Pod via CLI
         logger.info("Creating Pod")
-        if sc_name in (
-            constants.DEFAULT_STORAGECLASS_RBD_THICK,
-            constants.DEFAULT_STORAGECLASS_RBD,
-        ):
+        if sc_name in (constants.DEFAULT_STORAGECLASS_RBD,):
             interface_type = constants.CEPHBLOCKPOOL
         else:
             interface_type = constants.CEPHFILESYSTEM
@@ -222,3 +196,86 @@ class TestPvcUserInterface(object):
         pvcs = [pvc_obj for pvc_obj in pvc_objs if pvc_obj.name == pvc_name]
         if len(pvcs) > 0:
             assert f"PVC {pvcs[0].name} does not deleted"
+
+    @tier1
+    @pytest.mark.parametrize(
+        argnames=["sc_name", "access_mode", "clone_access_mode"],
+        argvalues=[
+            pytest.param(
+                "ocs-storagecluster-ceph-rbd",
+                constants.ACCESS_MODE_RWO,
+                constants.ACCESS_MODE_RWO,
+            ),
+            pytest.param(
+                "ocs-storagecluster-cephfs",
+                constants.ACCESS_MODE_RWX,
+                constants.ACCESS_MODE_RWO,
+            ),
+        ],
+    )
+    def test_clone_pvc(
+        self,
+        project_factory,
+        teardown_factory,
+        setup_ui,
+        sc_name,
+        access_mode,
+        clone_access_mode,
+    ):
+        """
+        Test to verify PVC clone from UI
+
+        """
+        pvc_size = "1"
+        vol_mode = constants.VOLUME_MODE_FILESYSTEM
+
+        # Creating a project from CLI
+        pro_obj = project_factory()
+        project_name = pro_obj.namespace
+
+        pvc_ui_obj = PvcUI(setup_ui)
+
+        # Creating PVC from UI
+        pvc_name = create_unique_resource_name("test", "pvc")
+        pvc_ui_obj.create_pvc_ui(
+            project_name, sc_name, pvc_name, access_mode, pvc_size, vol_mode
+        )
+
+        teardown_factory(get_pvc_objs(pvc_names=[pvc_name], namespace=project_name)[0])
+
+        # Verifying PVC details in UI
+        logger.info("Verifying PVC details in UI")
+        pvc_ui_obj.verify_pvc_ui(
+            pvc_size=pvc_size,
+            access_mode=access_mode,
+            vol_mode=vol_mode,
+            sc_name=sc_name,
+            pvc_name=pvc_name,
+            project_name=project_name,
+        )
+        logger.info("Verified PVC details in UI")
+
+        # Clone PVC from UI
+        clone_pvc_name = f"{pvc_name}-clone"
+        pvc_ui_obj.pvc_clone_ui(
+            project_name=project_name,
+            pvc_name=pvc_name,
+            cloned_pvc_access_mode=clone_access_mode,
+            cloned_pvc_name=clone_pvc_name,
+        )
+
+        teardown_factory(
+            get_pvc_objs(pvc_names=[clone_pvc_name], namespace=project_name)[0]
+        )
+
+        # Verifying cloned PVC details in UI
+        logger.info("Verifying cloned PVC details in UI")
+        pvc_ui_obj.verify_pvc_ui(
+            pvc_size=pvc_size,
+            access_mode=clone_access_mode,
+            vol_mode=vol_mode,
+            sc_name=sc_name,
+            pvc_name=clone_pvc_name,
+            project_name=project_name,
+        )
+        logger.info("Verified cloned PVC details in UI")

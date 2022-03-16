@@ -8,13 +8,16 @@ under section PYTEST_DONT_REWRITE
 """
 # Use the new python 3.7 dataclass decorator, which provides an object similar
 # to a namedtuple, but allows type enforcement and defining methods.
-import collections
 import os
 import yaml
+import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_PATH = os.path.join(THIS_DIR, "conf/default_config.yaml")
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -30,6 +33,8 @@ class Config:
     UI_SELENIUM: dict = field(default_factory=dict)
     PERF: dict = field(default_factory=dict)
     COMPONENTS: dict = field(default_factory=dict)
+    # Used for multicluster only
+    MULTICLUSTER: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self.reset()
@@ -58,6 +63,8 @@ class Config:
         out non-overridden items
         """
         field_names = [f.name for f in fields(self)]
+        if user_dict is None:
+            return
         for k, v in user_dict.items():
             if k not in field_names:
                 raise ValueError(
@@ -106,8 +113,8 @@ def merge_dict(orig: dict, new: dict) -> dict:
 
     """
     for k, v in new.items():
-        if isinstance(orig, collections.Mapping):
-            if isinstance(v, collections.Mapping):
+        if isinstance(orig, Mapping):
+            if isinstance(v, Mapping):
                 r = merge_dict(orig.get(k, dict()), v)
                 orig[k] = r
             else:
@@ -117,4 +124,90 @@ def merge_dict(orig: dict, new: dict) -> dict:
     return orig
 
 
-config = Config()
+class MultiClusterConfig:
+    # This class wraps Config() objects so that we can handle
+    # multiple cluster contexts
+    def __init__(self):
+        # Holds all cluster's Config() object
+        self.clusters = list()
+        # This member always points to current cluster's Config() object
+        self.cluster_ctx = None
+        self.nclusters = 1
+        # Index for current cluster in context
+        self.cur_index = 0
+        self.multicluster = False
+        # A list of lists which holds CLI args clusterwise
+        self.multicluster_args = list()
+        self.multicluster_common_args = list()
+        # Points to cluster config objects which holds ACM cluster conf
+        # Applicable only if we are deploying ACM cluster
+        self.acm_index = None
+        self.single_cluster_default = True
+        self._single_cluster_init_cluster_configs()
+
+    def _single_cluster_init_cluster_configs(self):
+        self.clusters.insert(0, Config())
+        self.cluster_ctx = self.clusters[0]
+        self.attr_init()
+        self._refresh_ctx()
+
+    def init_cluster_configs(self):
+        if self.nclusters > 1:
+            # reset if any single cluster object is present from init
+            self.clusters.clear()
+            for i in range(self.nclusters):
+                self.clusters.insert(i, Config())
+                self.clusters[i].MULTICLUSTER["multicluster_index"] = i
+            self.cluster_ctx = self.clusters[0]
+            self.attr_init()
+            self._refresh_ctx()
+            self.single_cluster_default = False
+
+    def attr_init(self):
+        self.attr_list = [attr for attr in self.cluster_ctx.__dataclass_fields__.keys()]
+
+    def update(self, user_dict):
+        self.cluster_ctx.update(user_dict)
+        self._refresh_ctx()
+
+    def reset(self):
+        self.cluster_ctx.reset()
+        self._refresh_ctx()
+
+    def get_defaults(self):
+        return self.cluster_ctx.get_defaults()
+
+    def reset_ctx(self):
+        self.cluster_ctx = self.clusters[0]
+        self._refresh_ctx()
+
+    def _refresh_ctx(self):
+        [
+            self.__setattr__(attr, self.cluster_ctx.__getattribute__(attr))
+            for attr in self.attr_list
+        ]
+        self.to_dict = self.cluster_ctx.to_dict
+        if self.RUN.get("kubeconfig"):
+            logger.debug("switching kubeconfig")
+            os.environ["KUBECONFIG"] = self.RUN.get("kubeconfig")
+
+    def switch_ctx(self, index=0):
+        self.cluster_ctx = self.clusters[index]
+        self.cur_index = index
+        self._refresh_ctx()
+
+    def switch_acm_ctx(self):
+        self.switch_ctx(self.get_acm_index())
+
+    def get_acm_index(self):
+        for cluster in self.clusters:
+            if cluster.MULTICLUSTER["acm_cluster"]:
+                return cluster.MULTICLUSTER["multicluster_index"]
+
+    def switch_default_cluster_ctx(self):
+        # We can check any conf for default_cluster_context_index
+        # because its a common arg
+        self.switch_ctx(self.cluster_ctx.ENV_DATA["default_cluster_context_index"])
+
+
+config = MultiClusterConfig()

@@ -1,4 +1,5 @@
 from functools import reduce
+import base64
 import io
 import json
 import logging
@@ -18,8 +19,9 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from scipy.stats import tmean, scoreatpercentile
 from shutil import which, move, rmtree
+import pexpect
 
-import hcl
+import hcl2
 import requests
 import yaml
 import git
@@ -41,7 +43,9 @@ from ocs_ci.ocs.exceptions import (
     UnavailableBuildException,
     UnexpectedImage,
     UnsupportedOSType,
+    InteractivePromptException,
 )
+from ocs_ci.utility import version as version_module
 from ocs_ci.utility.flexy import load_cluster_info
 from ocs_ci.utility.retry import retry
 
@@ -457,6 +461,88 @@ def run_cmd(cmd, secrets=None, timeout=600, ignore_error=False, **kwargs):
     return mask_secrets(completed_process.stdout.decode(), secrets)
 
 
+def run_cmd_interactive(cmd, prompts_answers, timeout=300):
+    """
+    Handle interactive prompts with answers during subctl command
+
+    Args:
+        cmd(str): Command to be executed
+        prompts_answers(dict): Prompts as keys and answers as values
+        timeout(int): Timeout in seconds, for pexpect to wait for prompt
+
+    Raises:
+        InteractivePromptException: in case something goes wrong
+
+    """
+    child = pexpect.spawn(cmd)
+    for prompt, answer in prompts_answers.items():
+        if child.expect(prompt, timeout=timeout):
+            raise InteractivePromptException("Unexpected Prompt")
+
+        if not child.sendline("".join([answer, constants.ENTER_KEY])):
+            raise InteractivePromptException("Failed to provide answer to the prompt")
+
+
+def run_cmd_multicluster(
+    cmd, secrets=None, timeout=600, ignore_error=False, skip_index=None, **kwargs
+):
+    """
+    Run command on multiple clusters. Useful in multicluster scenarios
+    This is wrapper around exec_cmd
+
+    Args:
+        cmd (str): command to be run
+        secrets (list): A list of secrets to be masked with asterisks
+            This kwarg is popped in order to not interfere with
+            subprocess.run(``**kwargs``)
+        timeout (int): Timeout for the command, defaults to 600 seconds.
+        ignore_error (bool): True if ignore non zero return code and do not
+            raise the exception.
+        skip_index (list of int): List of indexes that needs to be skipped from executing the command
+
+    Raises:
+        CommandFailed: In case the command execution fails
+
+    Returns:
+        list : of CompletedProcess objects as per cluster's index in config.clusters
+            i.e. [cluster1_completedprocess, None, cluster2_completedprocess]
+            if command execution skipped on a particular cluster then corresponding entry will have None
+
+    """
+    # Skip indexed cluster while running commands
+    # Useful to skip operations on ACM cluster
+    restore_ctx_index = config.cur_index
+    completed_process = [None] * len(config.clusters)
+    index = 0
+    for cluster in config.clusters:
+        if skip_index and (cluster.MULTICLUSTER["multicluster_index"] == skip_index):
+            log.warning(f"skipping index = {skip_index}")
+            continue
+        else:
+            config.switch_ctx(cluster.MULTICLUSTER["multicluster_index"])
+            log.info(
+                f"Switched the context to cluster:{cluster.ENV_DATA['cluster_name']}"
+            )
+            try:
+                completed_process[index] = exec_cmd(
+                    cmd,
+                    secrets=secrets,
+                    timeout=timeout,
+                    ignore_error=ignore_error,
+                    **kwargs,
+                )
+            except CommandFailed:
+                # In case of failure, restore the cluster context to where we started
+                config.switch_ctx(restore_ctx_index)
+                log.error(
+                    f"Command {cmd} execution failed on cluster {cluster.ENV_DATA['cluster_name']} "
+                )
+                raise
+            index = +1
+    config.switch_ctx(restore_ctx_index)
+    return completed_process
+
+
 def exec_cmd(cmd, secrets=None, timeout=600, ignore_error=False, **kwargs):
     """
     Run an arbitrary command locally
@@ -676,6 +762,53 @@ def get_ocm_cli(
     log.info(f"OCM version: {ocm_version}")
 
     return ocm_binary_path
+
+
+def get_rosa_cli(
+    version=None,
+    bin_dir=None,
+    force_download=False,
+):
+    """
+    Download the ROSA binary, if not already present.
+    Update env. PATH and get path of the ROSA binary.
+
+    Args:
+        version (str): Version of the ROSA to download
+        bin_dir (str): Path to bin directory (default: config.RUN['bin_dir'])
+        force_download (bool): Force ROSA download even if already present
+
+    Returns:
+        str: Path to the rosa binary
+
+    """
+    bin_dir = os.path.expanduser(bin_dir or config.RUN["bin_dir"])
+    rosa_filename = "rosa"
+    rosa_binary_path = os.path.join(bin_dir, rosa_filename)
+    if os.path.isfile(rosa_binary_path) and force_download:
+        delete_file(rosa_binary_path)
+    if os.path.isfile(rosa_binary_path):
+        log.debug(f"rosa exists ({rosa_binary_path}), skipping download.")
+    else:
+        log.info(f"Downloading rosa cli ({version}).")
+        prepare_bin_dir()
+        # record current working directory and switch to BIN_DIR
+        previous_dir = os.getcwd()
+        os.chdir(bin_dir)
+        url = f"https://github.com/openshift/rosa/releases/download/v{version}/rosa-linux-amd64"
+        download_file(url, rosa_filename)
+        # return to the previous working directory
+        os.chdir(previous_dir)
+
+    current_file_permissions = os.stat(rosa_binary_path)
+    os.chmod(
+        rosa_binary_path,
+        current_file_permissions.st_mode | stat.S_IEXEC,
+    )
+    rosa_version = run_cmd(f"{rosa_binary_path} version")
+    log.info(f"rosa version: {rosa_version}")
+
+    return rosa_binary_path
 
 
 def get_openshift_client(
@@ -1126,6 +1259,15 @@ def run_async(command):
 def is_cluster_running(cluster_path):
     from ocs_ci.ocs.openshift_ops import OCP
 
+    def _multicluster_is_cluster_running(cluster_path):
+        return config.RUN["cli_params"].get(
+            f"cluster_path{config.cluster_ctx.MULTICLUSTER['multicluster_index'] + 1}"
+        ) and OCP.set_kubeconfig(
+            os.path.join(cluster_path, config.RUN.get("kubeconfig_location"))
+        )
+
+    if config.multicluster:
+        return _multicluster_is_cluster_running(cluster_path)
     return config.RUN["cli_params"].get("cluster_path") and OCP.set_kubeconfig(
         os.path.join(cluster_path, config.RUN.get("kubeconfig_location"))
     )
@@ -1203,26 +1345,27 @@ def add_squad_analysis_to_email(session, soup):
     # sort out failed and skipped test cases to failed and skipped dicts
     for result in session.results.values():
         if result.failed or result.skipped:
-            unassigned = True
-            for squad, res in constants.SQUADS.items():
-                for item in res:
-                    if item in result.nodeid:
-                        if result.failed:
-                            if squad not in failed:
-                                failed[squad] = []
-                            failed[squad].append(result.nodeid)
-                            unassigned = False
+            squad_marks = [
+                key[:-6].capitalize() for key in result.keywords if "_squad" in key
+            ]
+            if squad_marks:
+                for squad in squad_marks:
+                    if result.failed:
+                        if squad not in failed:
+                            failed[squad] = []
+                        failed[squad].append(result.nodeid)
 
-                        if result.skipped:
-                            if squad not in skipped:
-                                skipped[squad] = []
-                            try:
-                                skipped_message = result.longrepr[2][8:]
-                            except TypeError:
-                                skipped_message = "--unknown--"
-                            skipped[squad].append((result.nodeid, skipped_message))
-                            unassigned = False
-            if unassigned:
+                    if result.skipped:
+                        if squad not in skipped:
+                            skipped[squad] = []
+                        try:
+                            skipped_message = result.longrepr[2][8:]
+                        except TypeError:
+                            skipped_message = "--unknown--"
+                        skipped[squad].append((result.nodeid, skipped_message))
+
+            else:
+                # unassigned
                 if result.failed:
                     if "UNASSIGNED" not in failed:
                         failed["UNASSIGNED"] = []
@@ -1438,17 +1581,48 @@ def get_ocs_build_number():
     """
     # Importing here to avoid circular dependency
     from ocs_ci.ocs.resources.csv import get_csvs_start_with_prefix
+    from ocs_ci.ocs.resources.catalog_source import CatalogSource
+    from ocs_ci.ocs.resources.packagemanifest import get_selector_for_ocs_operator
 
     build_num = ""
-    if config.REPORTING["us_ds"] == "DS":
-        build_str = get_csvs_start_with_prefix(
-            defaults.OCS_OPERATOR_NAME,
-            defaults.ROOK_CLUSTER_NAMESPACE,
-        )
-        try:
-            return build_str[0]["metadata"]["name"].partition(".")[2]
-        except (IndexError, AttributeError):
-            logging.warning("No version info found for OCS operator")
+    if (
+        version_module.get_semantic_ocs_version_from_config()
+        >= version_module.VERSION_4_9
+    ):
+        operator_name = defaults.ODF_OPERATOR_NAME
+    else:
+        operator_name = defaults.OCS_OPERATOR_NAME
+    ocs_csvs = get_csvs_start_with_prefix(
+        operator_name,
+        defaults.ROOK_CLUSTER_NAMESPACE,
+    )
+    try:
+        ocs_csv = ocs_csvs[0]
+        csv_labels = ocs_csv["metadata"]["labels"]
+        if "full_version" in csv_labels:
+            return csv_labels["full_version"]
+        build_num = ocs_csv["spec"]["version"]
+        operator_selector = get_selector_for_ocs_operator()
+        # This is a temporary solution how to get the build id from the registry image.
+        # Because we are now missing build ID in the CSV. If catalog source with our
+        # internal label exists, we will be getting build id from the tag of the image
+        # in catalog source. Boris is working on better way how to populate the internal
+        # build version in the CSV.
+        if operator_selector:
+            catalog_source = CatalogSource(
+                resource_name=constants.OPERATOR_CATALOG_SOURCE_NAME,
+                namespace=constants.MARKETPLACE_NAMESPACE,
+                selector=operator_selector,
+            )
+            cs_data = catalog_source.get()["items"][0]
+            cs_image = cs_data["spec"]["image"]
+            image_tag = cs_image.split(":")[1]
+            if "-" in image_tag:
+                build_id = image_tag.split("-")[1]
+                build_num += f"-{build_id}"
+
+    except (IndexError, AttributeError, CommandFailed, KeyError):
+        log.exception("No version info found for OCS operator")
     return build_num
 
 
@@ -1589,16 +1763,25 @@ def get_running_ocp_version(separator=None):
         return get_ocp_version(seperator=char)
 
 
-def get_ocp_repo():
+def get_ocp_repo(rhel_major_version=None):
     """
     Get ocp repo file, name will be generated dynamically based on
     ocp version.
+
+    Args:
+        rhel_major_version (int): Major version of RHEL. If not specified it will
+            take major version from config.ENV_DATA["rhel_version"]
 
     Returns:
         string : Path to ocp repo file
 
     """
-    repo_path = os.path.join(constants.REPO_DIR, f"ocp_{get_ocp_version('_')}.repo")
+    rhel_version = (
+        rhel_major_version or Version.coerce(config.ENV_DATA["rhel_version"]).major
+    )
+    repo_path = os.path.join(
+        constants.REPO_DIR, f"ocp_{get_ocp_version('_')}_rhel{rhel_version}.repo"
+    )
     path = os.path.expanduser(repo_path)
     assert os.path.exists(path), f"OCP repo file {path} doesn't exists!"
     return path
@@ -1707,7 +1890,9 @@ def get_testrun_name():
         us_ds = "Upstream"
     elif us_ds.upper() == "DS":
         us_ds = "Downstream"
-    ocp_version = ".".join(config.DEPLOYMENT.get("installer_version").split(".")[:-2])
+    ocp_version = version_module.get_semantic_version(
+        config.DEPLOYMENT.get("installer_version"), only_major_minor=True
+    )
     ocp_version_string = f"OCP{ocp_version}" if ocp_version else ""
     ocs_version = config.ENV_DATA.get("ocs_version")
     ocs_version_string = f"OCS{ocs_version}" if ocs_version else ""
@@ -2043,8 +2228,8 @@ def get_ocs_olm_operator_tags(limit=100):
     headers = {"Authorization": f"Bearer {quay_access_token}"}
     image = "ocs-registry"
     try:
-        ocs_version = float(config.ENV_DATA.get("ocs_version"))
-        if ocs_version < 4.5:
+        ocs_version = version_module.get_semantic_ocs_version_from_config()
+        if ocs_version < version_module.VERSION_4_5:
             image = "ocs-olm-operator"
     except (ValueError, TypeError):
         log.warning("Invalid ocs_version given, defaulting to ocs-registry image")
@@ -2244,6 +2429,7 @@ def create_rhelpod(namespace, pod_name, timeout=300):
     # importing here to avoid dependencies
     from ocs_ci.helpers import helpers
 
+    # TODO: This method should be updated to add argument to change RHEL version
     rhelpod_obj = helpers.create_pod(
         namespace=namespace,
         pod_name=pod_name,
@@ -2268,7 +2454,7 @@ def check_timeout_reached(start_time, timeout, err_msg=None):
     """
     msg = f"Timeout {timeout} reached!"
     if err_msg:
-        msg += " Error: {err_msg}"
+        msg += f" Error: {err_msg}"
 
     if timeout < (time.time() - start_time):
         raise TimeoutException(msg)
@@ -2332,7 +2518,7 @@ def remove_keys_from_tf_variable_file(tf_file, keys):
     from ocs_ci.utility.templating import dump_data_to_json
 
     with open(tf_file, "r") as fd:
-        obj = hcl.load(fd)
+        obj = hcl2.load(fd)
     for key in keys:
         obj["variable"].pop(key)
 
@@ -2396,14 +2582,11 @@ def skipif_ocp_version(expressions):
         'True' if test needs to be skipped else 'False'
 
     """
-    skip_this = True
     ocp_version = get_running_ocp_version()
     expr_list = [expressions] if isinstance(expressions, str) else expressions
-    for expr in expr_list:
-        comparision_str = ocp_version + expr
-        skip_this = skip_this and eval(comparision_str)
-    # skip_this will be either True or False after eval
-    return skip_this
+    return any(
+        version_module.compare_versions(ocp_version + expr) for expr in expr_list
+    )
 
 
 def skipif_ocs_version(expressions):
@@ -2420,7 +2603,10 @@ def skipif_ocs_version(expressions):
         'True' if test needs to be skipped else 'False'
     """
     expr_list = [expressions] if isinstance(expressions, str) else expressions
-    return any(eval(config.ENV_DATA["ocs_version"] + expr) for expr in expr_list)
+    return any(
+        version_module.compare_versions(config.ENV_DATA["ocs_version"] + expr)
+        for expr in expr_list
+    )
 
 
 def skipif_ui_not_support(ui_test):
@@ -2770,7 +2956,7 @@ def mirror_image(image):
         mirror_registry = config.DEPLOYMENT["mirror_registry"]
         mirrored_image = mirror_registry + re.sub(r"^[^/]*", "", orig_image_full)
         # mirror the image
-        logging.info(
+        log.info(
             f"Mirroring image '{image}' ('{orig_image_full}') to '{mirrored_image}'"
         )
         exec_cmd(
@@ -3077,6 +3263,8 @@ def wait_for_machineconfigpool_status(node_type, timeout=900):
         timeout (int): Time in seconds to wait
 
     """
+    log.info("Sleeping for 60 sec to start update machineconfigpool status")
+    time.sleep(60)
     # importing here to avoid dependencies
     from ocs_ci.ocs import ocp
 
@@ -3128,8 +3316,6 @@ def configure_chrony_and_wait_for_machineconfig_status(
         chrony_obj = OCS(**chrony_data)
         chrony_obj.create()
 
-        # sleep here to start update machineconfigpool status
-        time.sleep(60)
         wait_for_machineconfigpool_status(role, timeout=timeout)
 
 
@@ -3395,8 +3581,58 @@ def add_chrony_to_ocp_deployment():
 
 
 def enable_huge_pages():
+    """
+    Applies huge pages
+
+    """
     log.info("Enabling huge pages.")
     exec_cmd(f"oc apply -f {constants.HUGE_PAGES_TEMPLATE}")
     time.sleep(10)
     log.info("Waiting for machine config will be applied with huge pages")
-    wait_for_machineconfigpool_status(node_type=constants.WORKER_MACHINE)
+    wait_for_machineconfigpool_status(node_type=constants.WORKER_MACHINE, timeout=1200)
+
+
+def disable_huge_pages():
+    """
+    Removes huge pages
+
+    """
+    log.info("Disabling huge pages.")
+    exec_cmd(f"oc delete -f {constants.HUGE_PAGES_TEMPLATE}")
+    time.sleep(10)
+    log.info("Waiting for machine config to be ready")
+    wait_for_machineconfigpool_status(node_type=constants.WORKER_MACHINE, timeout=1200)
+
+
+def encode(message):
+    """
+    Encodes the message in base64
+
+    Args:
+        message (str/list): message to encode
+
+    Returns:
+        str: encoded message in base64
+
+    """
+    message_bytes = message.encode("ascii")
+    encoded_base64_bytes = base64.b64encode(message_bytes)
+    encoded_message = encoded_base64_bytes.decode("ascii")
+    return encoded_message
+
+
+def decode(encoded_message):
+    """
+    Decodes the message in base64
+
+    Args:
+        encoded_message (str): encoded message
+
+    Returns:
+        str: decoded message
+
+    """
+    encoded_message_bytes = encoded_message.encode("ascii")
+    decoded_base64_bytes = base64.b64decode(encoded_message_bytes)
+    decoded_message = decoded_base64_bytes.decode("ascii")
+    return decoded_message

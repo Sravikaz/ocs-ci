@@ -3,10 +3,9 @@ All the flexy related classes and functionality lives here
 """
 import base64
 import binascii
-import hcl
+import json
 import logging
 import os
-import time
 import yaml
 
 import io
@@ -140,26 +139,69 @@ class FlexyBase(object):
             "availability_zone_count", "1"
         )
         config.FLEXY["OPENSHIFT_SSHKEY_PATH"] = config.DEPLOYMENT["ssh_key_private"]
-        # translate vSphere secret configuration to Flexy variable BUSHSLICER_CONFIG
         if config.ENV_DATA["platform"].lower() == constants.VSPHERE_PLATFORM:
             config.FLEXY["LAUNCHER_VARS"].update(
                 {
                     "iaas_name": "vsphere_config",
-                    "rhcos_ami": config.ENV_DATA["vm_template"],
+                    "rhcos_image": config.ENV_DATA["vm_template"],
                 }
             )
             if config.DEPLOYMENT.get("proxy"):
                 config.FLEXY["LAUNCHER_VARS"].update(
                     {
-                        "http_proxy": config.ENV_DATA["proxy_http_proxy"],
-                        "https_proxy": config.ENV_DATA.get(
-                            "proxy_https_proxy", config.ENV_DATA["proxy_http_proxy"]
+                        "http_proxy": config.DEPLOYMENT["proxy_http_proxy"],
+                        "https_proxy": config.DEPLOYMENT.get(
+                            "proxy_https_proxy", config.DEPLOYMENT["proxy_http_proxy"]
                         ),
                         "proxy_for_client_on_install": config.ENV_DATA.get(
                             "client_http_proxy", ""
                         ),
                     }
                 )
+                logger.info(
+                    "Configured parameters in LAUNCHER_VARS for Proxy cluster: "
+                    f"{config.FLEXY['LAUNCHER_VARS']}"
+                )
+            if config.DEPLOYMENT.get("disconnected"):
+                base_domain = config.ENV_DATA["base_domain"]
+                cluster_name = config.ENV_DATA["cluster_name"]
+                cluster_domain = f".{cluster_name}.{base_domain}"
+                config.FLEXY["LAUNCHER_VARS"].update(
+                    {
+                        "http_proxy": config.DEPLOYMENT["disconnected_http_proxy"],
+                        "https_proxy": config.DEPLOYMENT.get(
+                            "disconnected_https_proxy",
+                            config.DEPLOYMENT["disconnected_http_proxy"],
+                        ),
+                        "no_proxy": ",".join(
+                            [
+                                cluster_domain,
+                                config.DEPLOYMENT.get("disconnected_no_proxy", ""),
+                            ]
+                        ),
+                        "enable_proxy": "yes",
+                        "proxy_for_client_on_install": config.ENV_DATA.get(
+                            "client_http_proxy", ""
+                        ),
+                    }
+                )
+                if config.DEPLOYMENT.get("mirror_registry"):
+                    config.FLEXY["LAUNCHER_VARS"].update(
+                        {
+                            "mirror_reg_url": config.DEPLOYMENT["mirror_registry"],
+                            "mirror_reg_user": config.DEPLOYMENT.get(
+                                "mirror_registry_user", ""
+                            ),
+                            "mirror_reg_passwd": config.DEPLOYMENT.get(
+                                "mirror_registry_password", ""
+                            ),
+                        }
+                    )
+                logger.info(
+                    "Configured parameters in LAUNCHER_VARS for Disconnected cluster: "
+                    f"{config.FLEXY['LAUNCHER_VARS']}"
+                )
+            # translate vSphere secret configuration to Flexy variable BUSHSLICER_CONFIG
             config.FLEXY["BUSHSLICER_CONFIG"].update(
                 {
                     "services": {
@@ -455,7 +497,7 @@ class FlexyBase(object):
         """
         Perform a few actions required after flexy execution:
         - update global pull-secret
-        - login to mirror registry (disconected cluster)
+        - login to mirror registry (disconnected cluster)
         - configure proxy server (disconnected cluster)
         - configure ntp (if required)
         """
@@ -478,25 +520,26 @@ class FlexyBase(object):
         # load cluster info
         load_cluster_info()
 
-        # Download terraform binary based on version used by Flexy and
-        # update the installer path in ENV_DATA
-        terraform_data_dir = os.path.join(
-            self.cluster_path, constants.TERRAFORM_DATA_DIR
-        )
-        terraform_tfstate = os.path.join(terraform_data_dir, "terraform.tfstate")
-        with open(terraform_tfstate, "r") as fd:
-            ttc = hcl.load(fd)
-            terraform_version = ttc.get(
-                "terraform_version", config.DEPLOYMENT["terraform_version"]
+        if config.ENV_DATA["platform"].lower() == constants.VSPHERE_PLATFORM:
+            # Download terraform binary based on version used by Flexy and
+            # update the installer path in ENV_DATA
+            terraform_data_dir = os.path.join(
+                self.cluster_path, constants.TERRAFORM_DATA_DIR
             )
-        terraform_installer = get_terraform(version=terraform_version)
-        config.ENV_DATA["terraform_installer"] = terraform_installer
+            terraform_tfstate = os.path.join(terraform_data_dir, "terraform.tfstate")
+            with open(terraform_tfstate, "r") as fd:
+                ttc = json.loads(fd.read())
+                terraform_version = ttc.get(
+                    "terraform_version", config.DEPLOYMENT["terraform_version"]
+                )
+            terraform_installer = get_terraform(version=terraform_version)
+            config.ENV_DATA["terraform_installer"] = terraform_installer
 
-        # Download terraform ignition provider
-        # ignition provider dependancy from OCP 4.6
-        ocp_version = get_ocp_version()
-        if Version.coerce(ocp_version) >= Version.coerce("4.6"):
-            get_terraform_ignition_provider(terraform_data_dir)
+            # Download terraform ignition provider
+            # ignition provider dependancy from OCP 4.6
+            ocp_version = get_ocp_version()
+            if Version.coerce(ocp_version) >= Version.coerce("4.6"):
+                get_terraform_ignition_provider(terraform_data_dir)
 
         # if on disconnected cluster, perform required tasks
         pull_secret_path = os.path.join(constants.DATA_DIR, "pull-secret")
@@ -504,7 +547,8 @@ class FlexyBase(object):
             # login to mirror registry
             login_to_mirror_registry(pull_secret_path)
             # configure additional allowed domains in proxy
-            configure_allowed_domains_in_proxy()
+            if config.ENV_DATA["platform"].lower() == constants.AWS_PLATFORM:
+                configure_allowed_domains_in_proxy()
 
         # update pull-secret
         secret_cmd = (
@@ -522,8 +566,6 @@ class FlexyBase(object):
             )
             logger.info("Creating NTP chrony")
             exec_cmd(ntp_cmd)
-        # sleep here to start update machineconfigpool status
-        time.sleep(60)
         wait_for_machineconfigpool_status("all")
 
     def deploy(self, log_level=""):
